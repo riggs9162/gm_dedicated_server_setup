@@ -3,6 +3,9 @@ import shutil
 import subprocess
 import sys
 
+GMOD_DEDICATED_APP_ID = "4020"
+MAX_INSTALL_ATTEMPTS = 3
+
 def download_steamcmd(steamcmd_dir):
     """Download and extract SteamCMD to the specified directory."""
     print("Downloading SteamCMD...")
@@ -26,20 +29,80 @@ def download_steamcmd(steamcmd_dir):
         print(f"Failed to extract SteamCMD: {e}")
         return False
 
+def clean_path(raw_path):
+    """Normalise a user-supplied path: trim whitespace, strip pasted quotes, expand variables and drop trailing separators."""
+    path = raw_path.strip().strip('"').strip("'")
+    if not path:
+        return ""
+
+    path = os.path.abspath(os.path.expandvars(os.path.expanduser(path)))
+    if len(path) > 3:
+        path = path.rstrip("\\/")
+
+    return path
+
 def get_path_input(prompt):
-    """Helper function to validate user input for paths."""
+    """Prompt until the user supplies a path that exists, returning it normalised."""
     while True:
-        path = input(prompt).strip()
-        if os.path.exists(path):
+        path = clean_path(input(prompt))
+        if path and os.path.exists(path):
             return path
-        else:
-            print(f"Path '{path}' does not exist. Try again.")
+        print(f"Path '{path}' does not exist. Try again.")
+
+def run_steamcmd(steamcmd_path, arguments):
+    """Run SteamCMD with the given argument list and return its exit code."""
+    return subprocess.run([steamcmd_path] + arguments).returncode
+
+def purge_appcache(steamcmd_dir):
+    """Delete SteamCMD's appcache directory, whose stale contents are the usual cause of 'Missing configuration'."""
+    appcache_dir = os.path.join(steamcmd_dir, "appcache")
+    if not os.path.isdir(appcache_dir):
+        return
+
+    try:
+        shutil.rmtree(appcache_dir)
+        print("Cleared SteamCMD's appcache.")
+    except OSError as e:
+        print(f"Could not clear appcache at {appcache_dir}: {e}")
+
+def bootstrap_steamcmd(steamcmd_path):
+    """Run SteamCMD on its own so it self-updates first; commands passed on a fresh install's very first run get dropped."""
+    print("Updating SteamCMD itself (this can take a minute on a fresh install)...")
+    run_steamcmd(steamcmd_path, ["+quit"])
+
+def install_gmod_server(steamcmd_dir, steamcmd_path, server_dir):
+    """Install or update the Garry's Mod dedicated server, clearing the appcache and retrying between failed attempts.
+
+    force_install_dir must be passed before login: SteamCMD applies it to the session that follows it, so setting
+    it afterwards leaves app_update without a valid install target.
+    """
+    arguments = [
+        "+force_install_dir", server_dir,
+        "+login", "anonymous",
+        "+app_update", GMOD_DEDICATED_APP_ID, "validate",
+        "+quit",
+    ]
+
+    for attempt in range(1, MAX_INSTALL_ATTEMPTS + 1):
+        print(f"Installing Garry's Mod dedicated server (attempt {attempt} of {MAX_INSTALL_ATTEMPTS})...")
+        try:
+            exit_code = run_steamcmd(steamcmd_path, arguments)
+        except Exception as e:
+            print(f"Failed to run SteamCMD: {e}")
+            return False
+
+        if exit_code == 0 and os.path.exists(os.path.join(server_dir, "srcds.exe")):
+            return True
+
+        print(f"SteamCMD did not complete the install (exit code {exit_code}).")
+        if attempt < MAX_INSTALL_ATTEMPTS:
+            purge_appcache(steamcmd_dir)
+
+    return False
 
 def create_server_cfg(server_name, server_dir):
     """Create or overwrite the server.cfg file."""
     cfg_file = os.path.join(server_dir, 'garrysmod', 'cfg', 'server.cfg')
-    
-    # Ensure the cfg folder exists
     cfg_dir = os.path.dirname(cfg_file)
     os.makedirs(cfg_dir, exist_ok=True)
 
@@ -56,20 +119,19 @@ def main():
     print("===================================")
 
     reinstall = input("Do you want to reinstall SteamCMD? (yes/no): ").strip().lower()
-    
+
     steamcmd_dir = ""
 
     if reinstall == "yes":
-        # Ask for SteamCMD installation path
-        steamcmd_dir = input("Enter the path where SteamCMD should be installed (e.g., C:\\steamcmd): ").strip()
+        steamcmd_dir = clean_path(input("Enter the path where SteamCMD should be installed (e.g., C:\\steamcmd): "))
         os.makedirs(steamcmd_dir, exist_ok=True)
         if not download_steamcmd(steamcmd_dir):
             print("Failed to install SteamCMD. Exiting.")
             sys.exit(1)
     else:
         steamcmd_dir = get_path_input("Enter the existing path to SteamCMD (e.g., C:\\steamcmd): ")
-    
-    server_dir = input("Enter the folder where you want the server to be installed (absolute path, e.g., C:\\gmodserver): ").strip()
+
+    server_dir = clean_path(input("Enter the folder where you want the server to be installed (absolute path, e.g., C:\\gmodserver): "))
     if not os.path.exists(server_dir):
         try:
             os.makedirs(server_dir)
@@ -80,7 +142,6 @@ def main():
 
     server_name = input("Enter a name for your server (this will be the server's hostname): ").strip()
 
-    # New prompts for collection ID, map, gamemode, and max players
     collection_id = input("Enter the Workshop collection ID (leave blank to ignore): ").strip()
     map_name = input("Enter the map name (default: gm_construct, leave blank to use default): ").strip() or "gm_construct"
     gamemode = input("Enter the gamemode (default: sandbox, leave blank to use default): ").strip() or "sandbox"
@@ -91,23 +152,23 @@ def main():
         print(f"SteamCMD not found at {steamcmd_path}. Exiting.")
         sys.exit(1)
 
-    # Run SteamCMD to install the Garry's Mod server
-    print("Starting server installation via SteamCMD...")
-    try:
-        subprocess.run([steamcmd_path, "+login", "anonymous", "+force_install_dir", server_dir, "+app_update", "4020", "validate", "+quit"])
-        print("Server installed successfully!")
-    except Exception as e:
-        print(f"Failed to run SteamCMD: {e}")
+    bootstrap_steamcmd(steamcmd_path)
+
+    if not install_gmod_server(steamcmd_dir, steamcmd_path, server_dir):
+        print("")
+        print("The server files were not installed. Things worth checking:")
+        print(f"  - Free space on the drive holding {server_dir}; the install needs roughly 15 GB.")
+        print("  - Install to a plain local folder, not a network drive or a cloud-synced folder.")
+        print(f"  - Run it by hand to read the full output: \"{steamcmd_path}\" +force_install_dir \"{server_dir}\" +login anonymous +app_update {GMOD_DEDICATED_APP_ID} validate +quit")
         sys.exit(1)
 
-    # Create or update the server.cfg file with the server name
+    print("Server installed successfully!")
+
     create_server_cfg(server_name, server_dir)
 
-    # Create the startup script for the server
     start_script = os.path.join(server_dir, "start_server.bat")
     try:
         with open(start_script, "w") as f:
-            # Construct the command with the new options
             command = (
                 f'start "SRCDS" /B srcds.exe -game garrysmod -conlog -port 27015 '
                 f'-console -conclearlog -condebug -tvdisable -maxplayers {max_players} '
@@ -124,8 +185,8 @@ def main():
     except Exception as e:
         print(f"Failed to create start script: {e}")
         sys.exit(1)
-    
+
     print("Setup complete! Run 'start_server.bat' in your server directory to start your server.")
-    
+
 if __name__ == "__main__":
     main()
