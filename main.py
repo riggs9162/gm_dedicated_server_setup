@@ -1,192 +1,117 @@
-import os
-import shutil
-import subprocess
+﻿"""Interactive and unattended command-line server management."""
+
+import argparse
+import getpass
+import json
+import signal
 import sys
+import threading
+from dataclasses import asdict
 
-GMOD_DEDICATED_APP_ID = "4020"
-MAX_INSTALL_ATTEMPTS = 3
+import gmod_server as core
 
-def download_steamcmd(steamcmd_dir):
-    """Download and extract SteamCMD to the specified directory."""
-    print("Downloading SteamCMD...")
-    steamcmd_url = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip"
-    zip_file_path = os.path.join(steamcmd_dir, "steamcmd.zip")
 
+def parser():
+    result = argparse.ArgumentParser(description=__doc__)
+    operations = result.add_mutually_exclusive_group()
+    for operation in core.OPERATIONS:
+        operations.add_argument('--' + operation, dest='operation', action='store_const', const=operation)
+    result.add_argument('--profile', help='Load a saved profile')
+    result.add_argument('--save-profile', metavar='NAME')
+    result.add_argument('--list-profiles', action='store_true')
+    for key in asdict(core.Settings()):
+        if key not in ('lan', 'password'):
+            result.add_argument('--' + key.replace('_', '-'))
+    network = result.add_mutually_exclusive_group()
+    network.add_argument('--lan', action='store_true', default=None)
+    network.add_argument('--internet', dest='lan', action='store_false')
+    result.add_argument('--ask-password', action='store_true', help='Prompt securely; an empty value removes the password')
+    result.add_argument('--discover', action='store_true', help='List installed loose maps and gamemodes')
+    result.add_argument('--start', action='store_true', help='Start after the selected operation, or start only')
+    result.add_argument('--list-links', action='store_true')
+    result.add_argument('--link', nargs=3, metavar=('CATEGORY', 'NAME', 'SOURCE'), help='Create a managed addon/gamemode link')
+    result.add_argument('--link-type', choices=('junction', 'symlink'), default='junction')
+    result.add_argument('--unlink', nargs=2, metavar=('CATEGORY', 'NAME'), help='Remove a managed link, preserving its source')
+    return result
+
+
+def interactive():
+    """Collect settings without starting downloads before validation."""
+    names = core.list_profiles()
+    print('Garry\'s Mod Dedicated Server Setup')
+    if names:
+        print('Profiles: ' + ', '.join(names))
+    name = input('Profile to load (blank for a new server): ').strip()
+    settings = core.load_profile(name) if name else core.Settings()
+    operation = input('Operation [install/update/repair/configure] (install): ').strip().lower() or 'install'
+    if operation not in core.OPERATIONS:
+        raise ValueError('Choose install, update, repair, or configure.')
+    for key, value in asdict(settings).items():
+        if key not in ('password', 'lan'):
+            answer = input(f"{key.replace('_', ' ').capitalize()} [{value}]: ").strip()
+            if answer:
+                setattr(settings, key, answer)
+    answer = input(f'LAN only [{"yes" if settings.lan else "no"}]: ').strip().lower()
+    if answer:
+        settings.lan = answer in ('yes', 'y')
+    if input('Change server password? [y/N]: ').strip().lower() == 'y':
+        settings.password = getpass.getpass('Password (blank removes it): ')
+    name = input(f'Save profile as [{name or "default"}]: ').strip() or name or 'default'
+    return settings, operation, name
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    cancel = threading.Event()
+    previous = signal.signal(signal.SIGINT, lambda *_: cancel.set())
+    log = None
     try:
-        import urllib.request
-        urllib.request.urlretrieve(steamcmd_url, zip_file_path)
-        print("Download complete!")
-    except Exception as e:
-        print(f"Failed to download SteamCMD: {e}")
-        return False
+        if args.list_profiles:
+            print('\n'.join(core.list_profiles()) or 'No saved profiles.')
+            return 0
+        if not (sys.argv[1:] if argv is None else argv):
+            settings, operation, save_name = interactive()
+        else:
+            settings = core.load_profile(args.profile) if args.profile else core.Settings()
+            for key in asdict(settings):
+                if key != 'password' and getattr(args, key, None) is not None:
+                    setattr(settings, key, getattr(args, key))
+            if args.ask_password:
+                settings.password = getpass.getpass('Server password (blank removes it): ')
+            operation, save_name = args.operation, args.save_profile
+        settings = core.validate(settings)
+        if save_name:
+            core.save_profile(save_name, settings)
+        if args.discover:
+            maps, modes = core.discover_content(settings.server_dir)
+            print(json.dumps(dict(maps=maps, gamemodes=modes), indent=2))
+        if args.list_links:
+            print(json.dumps(core.list_links(settings.server_dir), indent=2))
+        if args.link:
+            category, name, source = args.link
+            print(core.create_link(settings.server_dir, category, name, source, args.link_type))
+        if args.unlink:
+            core.remove_link(settings.server_dir, *args.unlink)
+            print('Link removed; source files preserved.')
+        if operation:
+            log = core.OperationLog(secrets=[settings.password])
+            print(f'Full log: {log.path}')
+            core.run_operation(settings, operation, log, cancel)
+        core.check_cancel(cancel)
+        if args.start:
+            core.start_server(settings.server_dir)
+        if not any((operation, save_name, args.discover, args.list_links, args.link, args.unlink, args.start)):
+            parser().print_help()
+        return 0
+    except core.Cancelled as error:
+        (log or print)(str(error))
+        return 130
+    except (OSError, ValueError, RuntimeError) as error:
+        (log or print)(f'Failed: {error}')
+        return 1
+    finally:
+        signal.signal(signal.SIGINT, previous)
 
-    try:
-        shutil.unpack_archive(zip_file_path, steamcmd_dir)
-        os.remove(zip_file_path)
-        print(f"SteamCMD installed at {steamcmd_dir}")
-        return True
-    except Exception as e:
-        print(f"Failed to extract SteamCMD: {e}")
-        return False
 
-def clean_path(raw_path):
-    """Normalise a user-supplied path: trim whitespace, strip pasted quotes, expand variables and drop trailing separators."""
-    path = raw_path.strip().strip('"').strip("'")
-    if not path:
-        return ""
-
-    path = os.path.abspath(os.path.expandvars(os.path.expanduser(path)))
-    if len(path) > 3:
-        path = path.rstrip("\\/")
-
-    return path
-
-def get_path_input(prompt):
-    """Prompt until the user supplies a path that exists, returning it normalised."""
-    while True:
-        path = clean_path(input(prompt))
-        if path and os.path.exists(path):
-            return path
-        print(f"Path '{path}' does not exist. Try again.")
-
-def run_steamcmd(steamcmd_path, arguments):
-    """Run SteamCMD with the given argument list and return its exit code."""
-    return subprocess.run([steamcmd_path] + arguments).returncode
-
-def purge_appcache(steamcmd_dir):
-    """Delete SteamCMD's appcache directory, whose stale contents are the usual cause of 'Missing configuration'."""
-    appcache_dir = os.path.join(steamcmd_dir, "appcache")
-    if not os.path.isdir(appcache_dir):
-        return
-
-    try:
-        shutil.rmtree(appcache_dir)
-        print("Cleared SteamCMD's appcache.")
-    except OSError as e:
-        print(f"Could not clear appcache at {appcache_dir}: {e}")
-
-def bootstrap_steamcmd(steamcmd_path):
-    """Run SteamCMD on its own so it self-updates first; commands passed on a fresh install's very first run get dropped."""
-    print("Updating SteamCMD itself (this can take a minute on a fresh install)...")
-    run_steamcmd(steamcmd_path, ["+quit"])
-
-def install_gmod_server(steamcmd_dir, steamcmd_path, server_dir):
-    """Install or update the Garry's Mod dedicated server, clearing the appcache and retrying between failed attempts.
-
-    force_install_dir must be passed before login: SteamCMD applies it to the session that follows it, so setting
-    it afterwards leaves app_update without a valid install target.
-    """
-    arguments = [
-        "+force_install_dir", server_dir,
-        "+login", "anonymous",
-        "+app_update", GMOD_DEDICATED_APP_ID, "validate",
-        "+quit",
-    ]
-
-    for attempt in range(1, MAX_INSTALL_ATTEMPTS + 1):
-        print(f"Installing Garry's Mod dedicated server (attempt {attempt} of {MAX_INSTALL_ATTEMPTS})...")
-        try:
-            exit_code = run_steamcmd(steamcmd_path, arguments)
-        except Exception as e:
-            print(f"Failed to run SteamCMD: {e}")
-            return False
-
-        if exit_code == 0 and os.path.exists(os.path.join(server_dir, "srcds.exe")):
-            return True
-
-        print(f"SteamCMD did not complete the install (exit code {exit_code}).")
-        if attempt < MAX_INSTALL_ATTEMPTS:
-            purge_appcache(steamcmd_dir)
-
-    return False
-
-def create_server_cfg(server_name, server_dir):
-    """Create or overwrite the server.cfg file."""
-    cfg_file = os.path.join(server_dir, 'garrysmod', 'cfg', 'server.cfg')
-    cfg_dir = os.path.dirname(cfg_file)
-    os.makedirs(cfg_dir, exist_ok=True)
-
-    try:
-        with open(cfg_file, 'w') as cfg:
-            cfg.write(f"hostname \"{server_name}\"\n")
-            print(f"server.cfg updated with hostname: {server_name}")
-    except Exception as e:
-        print(f"Failed to create or update server.cfg: {e}")
-
-def main():
-    print("===================================")
-    print("Garry's Mod Dedicated Server Setup")
-    print("===================================")
-
-    reinstall = input("Do you want to reinstall SteamCMD? (yes/no): ").strip().lower()
-
-    steamcmd_dir = ""
-
-    if reinstall == "yes":
-        steamcmd_dir = clean_path(input("Enter the path where SteamCMD should be installed (e.g., C:\\steamcmd): "))
-        os.makedirs(steamcmd_dir, exist_ok=True)
-        if not download_steamcmd(steamcmd_dir):
-            print("Failed to install SteamCMD. Exiting.")
-            sys.exit(1)
-    else:
-        steamcmd_dir = get_path_input("Enter the existing path to SteamCMD (e.g., C:\\steamcmd): ")
-
-    server_dir = clean_path(input("Enter the folder where you want the server to be installed (absolute path, e.g., C:\\gmodserver): "))
-    if not os.path.exists(server_dir):
-        try:
-            os.makedirs(server_dir)
-            print(f"Created server directory at {server_dir}")
-        except Exception as e:
-            print(f"Failed to create server directory: {e}")
-            sys.exit(1)
-
-    server_name = input("Enter a name for your server (this will be the server's hostname): ").strip()
-
-    collection_id = input("Enter the Workshop collection ID (leave blank to ignore): ").strip()
-    map_name = input("Enter the map name (default: gm_construct, leave blank to use default): ").strip() or "gm_construct"
-    gamemode = input("Enter the gamemode (default: sandbox, leave blank to use default): ").strip() or "sandbox"
-    max_players = input("Enter the maximum number of players (default: 32, leave blank to use default): ").strip() or "32"
-
-    steamcmd_path = os.path.join(steamcmd_dir, "steamcmd.exe")
-    if not os.path.exists(steamcmd_path):
-        print(f"SteamCMD not found at {steamcmd_path}. Exiting.")
-        sys.exit(1)
-
-    bootstrap_steamcmd(steamcmd_path)
-
-    if not install_gmod_server(steamcmd_dir, steamcmd_path, server_dir):
-        print("")
-        print("The server files were not installed. Things worth checking:")
-        print(f"  - Free space on the drive holding {server_dir}; the install needs roughly 15 GB.")
-        print("  - Install to a plain local folder, not a network drive or a cloud-synced folder.")
-        print(f"  - Run it by hand to read the full output: \"{steamcmd_path}\" +force_install_dir \"{server_dir}\" +login anonymous +app_update {GMOD_DEDICATED_APP_ID} validate +quit")
-        sys.exit(1)
-
-    print("Server installed successfully!")
-
-    create_server_cfg(server_name, server_dir)
-
-    start_script = os.path.join(server_dir, "start_server.bat")
-    try:
-        with open(start_script, "w") as f:
-            command = (
-                f'start "SRCDS" /B srcds.exe -game garrysmod -conlog -port 27015 '
-                f'-console -conclearlog -condebug -tvdisable -maxplayers {max_players} '
-                f'+gamemode {gamemode} +r_hunkalloclightmaps 0 +map {map_name} -tickrate 66 +fps_max 66'
-            )
-
-            if collection_id:
-                command += f' +host_workshop_collection "{collection_id}"'
-
-            command += " +sv_lan 0\n"
-
-            f.write(command)
-            print(f"Start script created at {start_script}")
-    except Exception as e:
-        print(f"Failed to create start script: {e}")
-        sys.exit(1)
-
-    print("Setup complete! Run 'start_server.bat' in your server directory to start your server.")
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    sys.exit(main())
