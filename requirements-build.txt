@@ -1,0 +1,4 @@
+flet==0.86.1
+flet-desktop==0.86.1
+flet-cli==0.86.1
+pyinstaller==6.19.0

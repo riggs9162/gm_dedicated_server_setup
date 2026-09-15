@@ -4,6 +4,20 @@ A Windows tool for temporary Garry's Mod servers, LAN sessions and local develop
 
 ## Run
 
+### Windows executable
+
+Open `dist\GModServerSetup.exe` and accept the Windows administrator prompt. Python is bundled, so it does not need to be installed on the computer running the executable. You can move the executable to another folder or Windows PC.
+
+To rebuild on Windows with Python 3.12 or newer:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
+```
+
+The script installs pinned build dependencies in `.venv-build` and uses [Flet's executable packager](https://flet.dev/docs/publish/using-pyinstaller/) with `--uac-admin`. Rebuilding replaces the generated `build` and `dist` folders. Profiles and logs remain in `%LOCALAPPDATA%\GModServerSetup`.
+
+### Python source
+
 Requires **Windows and Python 3.12 or newer**.
 
 ```powershell
