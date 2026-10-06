@@ -49,7 +49,7 @@ SteamCMD is bootstrapped before installation. Its exit status and installation c
 
 The GUI saves the current profile before running and restores the last saved profile on startup. Use **Save** to save a named profile without running an operation. Both interfaces store profiles under `%LOCALAPPDATA%\GModServerSetup`.
 
-Configure manages hostname, server password and LAN mode in a marked block at the end of `garrysmod\cfg\server.cfg`. Existing custom commands and comments are retained. The later managed settings take precedence over earlier values. The launcher contains map, gamemode, port, player count and the optional Workshop collection.
+Configure manages hostname, server password and LAN mode in a marked block at the end of `garrysmod\cfg\server.cfg`. Existing custom commands and comments are retained. The later managed settings take precedence over earlier values. The launcher contains map, gamemode, port, player count and the optional Workshop collection. It uses `srcds_console_win64.exe` when installed, otherwise `srcds_console.exe`, so server output and command input stay in the calling terminal. In the VS Code terminal, change to the server directory and run `.\start_server.bat`. GUI launch actions still open an interactive console window.
 
 Changed configuration and launcher files receive timestamped `.bak` copies beside the originals. Writes are atomic per file. A failure stops the operation and is reported; if an earlier stage completed, its changes remain and its backups are available.
 

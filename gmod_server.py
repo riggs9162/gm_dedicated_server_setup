@@ -26,6 +26,7 @@ DEFAULT_MAX_PLAYERS = '32'
 DEFAULT_PORT = '27015'
 DATA_DIR = Path(os.environ.get('LOCALAPPDATA', Path.home())) / 'GModServerSetup'
 OPERATIONS = ('install', 'update', 'repair', 'configure')
+SERVER_EXECUTABLES = ('srcds.exe', 'srcds_win64.exe', 'srcds_console.exe', 'srcds_console_win64.exe')
 
 
 class Cancelled(Exception):
@@ -327,8 +328,10 @@ def write_configuration(settings):
 
 
 def build_start_command(settings):
+    """Build a launcher that runs the server console in the calling terminal."""
     settings = validate(settings)
-    command = (f'srcds.exe -game garrysmod -console -condebug -port {settings.port} '
+    executable = 'srcds_console_win64.exe' if (Path(settings.server_dir) / 'srcds_console_win64.exe').is_file() else 'srcds_console.exe'
+    command = (f'{executable} -game garrysmod -condebug -port {settings.port} '
                f'-maxplayers {settings.max_players} +gamemode {settings.gamemode} +map {settings.map_name}')
     if settings.collection_id:
         command += f' +host_workshop_collection {settings.collection_id}'
@@ -348,13 +351,15 @@ def preflight(settings, operation, log=print):
         directory.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryFile(dir=directory):
             pass
-    command = "Get-CimInstance Win32_Process -Filter \"Name='srcds.exe'\" | Select-Object -ExpandProperty ExecutablePath | ConvertTo-Json -Compress"
+    process_filter = " OR ".join(f"Name='{name}'" for name in SERVER_EXECUTABLES)
+    command = f'Get-CimInstance Win32_Process -Filter "{process_filter}" | Select-Object -ExpandProperty ExecutablePath | ConvertTo-Json -Compress'
     result = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', command], capture_output=True, text=True, creationflags=NO_WINDOW, timeout=20)
     if result.returncode:
         raise RuntimeError('Could not check running servers: ' + result.stderr.strip())
     paths = (json.loads(result.stdout) or []) if result.stdout.strip() else []
     paths = [paths] if isinstance(paths, str) else paths
-    if any(p and Path(p).resolve() == (server / 'srcds.exe').resolve() for p in paths):
+    server_paths = {(server / name).resolve() for name in SERVER_EXECUTABLES}
+    if any(p and Path(p).resolve() in server_paths for p in paths):
         raise RuntimeError('Stop this server before modifying its files.')
     if operation != 'configure':
         free = shutil.disk_usage(server).free / (1024 ** 3)

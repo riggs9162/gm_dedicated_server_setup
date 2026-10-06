@@ -180,10 +180,22 @@ class ServerTests(unittest.TestCase):
 
     def test_preflight_detects_running_server(self):
         server = self.install_stub()
-        result = Mock(returncode=0, stdout=json.dumps(str(server / 'srcds.exe')))
-        with patch.object(core.subprocess, 'run', return_value=result):
-            with self.assertRaisesRegex(RuntimeError, 'Stop this server'):
-                core.preflight(self.settings, 'configure')
+        for executable in core.SERVER_EXECUTABLES:
+            with self.subTest(executable=executable):
+                result = Mock(returncode=0, stdout=json.dumps(str(server / executable)))
+                with patch.object(core.subprocess, 'run', return_value=result) as run:
+                    with self.assertRaisesRegex(RuntimeError, 'Stop this server'):
+                        core.preflight(self.settings, 'configure')
+                    self.assertIn(f"Name='{executable}'", run.call_args.args[0][-1])
+
+    def test_launcher_uses_available_console_architecture(self):
+        server = self.install_stub()
+        self.assertTrue(core.build_start_command(self.settings).startswith('srcds_console.exe '))
+        (server / 'srcds_console_win64.exe').touch()
+        script = core.write_configuration(self.settings).read_text()
+        self.assertIn('srcds_console_win64.exe -game garrysmod -condebug', script)
+        self.assertNotIn(' -console ', script)
+        self.assertNotIn('start "SRCDS"', script)
 
     def test_preflight_checks_low_disk_space(self):
         result = Mock(returncode=0, stdout='')
